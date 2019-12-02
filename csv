@@ -1,0 +1,342 @@
+package com.cloudcare.web.resource;
+
+import com.aliyun.odps.utils.StringUtils;
+import com.cloudcare.cbis.cloud.dataManage.data.model.DataSourceManager;
+import com.cloudcare.cbis.cloud.dataManage.data.repository.AssetDataManageRepository;
+import com.cloudcare.cbis.cloud.dataManage.data.repository.DataProductTableRepository;
+import com.cloudcare.cbis.cloud.dataManage.data.repository.DataSourceManagerRepository;
+import com.cloudcare.cbis.common.DataSourceType;
+import com.cloudcare.cbis.common.ExcelFileUtils;
+import com.cloudcare.cbis.delivery.dataManage.biz.domain.LinkInfo;
+import com.cloudcare.cbis.delivery.dataManage.biz.service.DataFileDownloadLogService;
+import com.cloudcare.cbis.delivery.dataManage.biz.service.DataSourceManagerService;
+import com.cloudcare.cbis.delivery.dataManage.biz.util.AssemblySql;
+import com.cloudcare.cbis.delivery.dataManage.biz.util.Base64Util;
+import com.cloudcare.cbis.delivery.dataManage.biz.util.dataSource.DataSourceHolder;
+import com.cloudcare.common.lang.LocaleBizServiceException;
+import com.cloudcare.common.lang.serialize.JSON;
+import com.cloudcare.web.api.ActionResponse;
+import com.cloudcare.web.api.utils.ActionExceptionHelper;
+import com.cloudcare.web.container.ApiService;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.joda.time.DateTime;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.*;
+import javax.ws.rs.core.Context;
+import javax.ws.rs.core.MediaType;
+import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.net.URLEncoder;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+
+//下载表
+@Controller
+@Path("/downloadtable")
+@Produces(MediaType.APPLICATION_JSON)
+public class DownloadTableData {
+
+    protected final Logger sysLogger = LoggerFactory.getLogger(this.getClass());
+
+    @Autowired
+    ApiService apiService;
+
+    @Autowired
+    DataProductTableRepository dataProductTableRepository;
+
+    @Autowired
+    AssetDataManageRepository assetDataManageRepository;
+
+    @Autowired
+    DataSourceManagerRepository dataSourceManagerRepository;
+    @Context
+    HttpServletResponse response;
+
+    @Context
+    HttpServletRequest request;
+
+    @Autowired
+    DataFileDownloadLogService dataFileDownloadLogService;
+    @Autowired
+    DataSourceManagerService dataSourceManagerService;
+
+    static final Map<String, Integer> sizes = new ConcurrentHashMap<>();
+
+    static final int core = Runtime.getRuntime().availableProcessors();
+    private static ExecutorService executor = new ThreadPoolExecutor(core, core, 0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(10));
+    private static final String[] COLUM_KEY = new String[]{"Field", "Comment"};
+
+    @GET
+    @Path("count")
+    @Consumes
+    public String getTableCount(@QueryParam("datasourceid") String datasourceid,
+                                @QueryParam("tableName") String tableName) {
+        DataSourceManager dataSourceManager = dataSourceManagerRepository.findModelById(datasourceid);
+        String countSql = "SELECT count(*) FROM " + tableName;
+        DataSourceType dataSourceType = dataSourceManager.getDataSourceType();
+        LinkInfo linkInfo = JSON.toBean(dataSourceManager.getLinkInfo(), LinkInfo.class);
+        linkInfo.setPassword(Base64Util.decodedText(linkInfo.getPassword()));
+        List<Map<String, Object>> countResult = dataSourceManagerService.executeSql(countSql, dataSourceType.name(), linkInfo, null);
+        String count = countResult.get(0).get("count(*)") + "";
+        sizes.put(datasourceid + tableName, Integer.valueOf(count));
+        return count;
+    }
+
+
+    @GET
+    @Path("table")
+    @Consumes
+    public ActionResponse dataProductTableExport2(@QueryParam("datasourceid") String datasourceid,
+                                                  @QueryParam("tableName") String tableName) {
+        Object actionResponse = null;
+        //数据库信息
+        DataSourceManager dataSourceManager = dataSourceManagerRepository.findModelById(datasourceid);
+        if (dataSourceManager == null) {
+            return null;
+        }
+        DataSourceType dataSourceType = dataSourceManager.getDataSourceType();
+        LinkInfo linkInfo = JSON.toBean(dataSourceManager.getLinkInfo(), LinkInfo.class);
+        linkInfo.setPassword(Base64Util.decodedText(linkInfo.getPassword()));
+        //覆盖一下
+        List<Map<String, Object>> mapList = dataSourceManagerService.queryAllDataSourceInfo(linkInfo);
+        DataSourceHolder.loadData(mapList);
+        //计数
+        String countSql = "SELECT count(*) FROM " + tableName;
+        List<Map<String, Object>> countResult = dataSourceManagerService.executeSql(countSql, dataSourceType.name(), linkInfo, null);
+        Long count = (Long) countResult.get(0).get("count(*)");
+        //获取字段中文名称
+        List<Map<String, String>> resultMap = new LinkedList<>();
+        String columSql = AssemblySql.queryTableFiledAndComment(tableName);
+        List<Map<String, Object>> colums = dataSourceManagerService.executeSql(columSql, dataSourceType.name(), linkInfo, null);
+        Map<String, Object> commentResultMap = Maps.newHashMap();
+        for (Map<String, Object> tableFiledAndCommentMap : colums) {
+            String filedName = (String) tableFiledAndCommentMap.get("Field");
+            Object commentName = tableFiledAndCommentMap.get("Comment");
+            commentResultMap.put(filedName, commentName);
+        }
+        //查询所有数据
+        long curCount = 0;
+        LinkedBlockingQueue<List<Map<String, Object>>> queue = new LinkedBlockingQueue<>(5);
+        SelectTask selectTask = new SelectTask(count, tableName, dataSourceType.name(),
+                linkInfo, dataSourceManagerService, queue);
+        executor.execute(selectTask);
+
+        //写入表头信息
+        PrintWriter out = null;
+        try {
+            out = response.getWriter();
+            DateTimeFormatter formatter = DateTimeFormat.forPattern("yyyyMMddHHmmss");
+            String fileName = URLEncoder.encode(tableName + "-" + new DateTime().toString(formatter) + ".csv", "UTF-8");
+            response.addHeader("Content-disposition", "attachment;filename=" + fileName);
+            List<Map<String, Object>> datas = null;
+            String[] columns = commentResultMap.keySet().toArray(new String[0]);
+            //写入头bom
+            out.print(new String(new byte[]{(byte) 0xEF, (byte) 0xBB, (byte) 0xBF}));
+            out.flush();
+            //写入中文表
+            out.print(handleExportData(commentResultMap, commentResultMap.keySet().toArray(new String[0])));
+            out.flush();
+
+            //写入表数据
+            while (curCount != count) {
+                datas = queue.poll(20, TimeUnit.SECONDS);
+                if (datas == null) {
+                    break;
+                }
+                if (datas.size() > 0) {
+                    for (Map<String, Object> data : datas) {
+                        out.print(handleExportData(data, columns));
+                        out.flush();
+                    }
+                    curCount += datas.size();
+                }
+            }
+            selectTask.closeSelect();
+            out.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+            actionResponse = ActionExceptionHelper.toResponse(e);
+            return (ActionResponse) actionResponse;
+        }
+        return null;
+    }
+
+    class SelectTask extends Thread {
+        private static final long STEP_NUM = 1000;
+        private long count;
+        private String tableName;
+        private String dataSourceType;
+        private LinkInfo linkInfo;
+        private DataSourceManagerService dataSourceManagerService;
+        private LinkedBlockingQueue<List<Map<String, Object>>> resultQueue;
+        private volatile boolean CLOSE = false;
+
+        public SelectTask(long count, String tableName, String dataSourceType, LinkInfo linkInfo, DataSourceManagerService dataSourceManagerService, LinkedBlockingQueue<List<Map<String, Object>>> resultQueue) {
+            super("SELECT-THREAD");
+            this.count = count;
+            this.tableName = tableName;
+            this.dataSourceType = dataSourceType;
+            this.linkInfo = linkInfo;
+            this.dataSourceManagerService = dataSourceManagerService;
+            this.resultQueue = resultQueue;
+        }
+
+        @Override
+        public void run() {
+            long start = 0;
+            long size = count > STEP_NUM ? STEP_NUM : count;
+            Integer num = 0;
+            String baseSql = "SELECT * FROM " + tableName + " limit ";
+            do {
+                String datasql = baseSql + start + " , " + size;
+                List<Map<String, Object>> maps = dataSourceManagerService.executeSql(datasql, dataSourceType, linkInfo, null);
+                start += size;
+                size = count - size > STEP_NUM ? STEP_NUM : size;
+                try {
+                    resultQueue.put(maps);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            } while (CLOSE == false && start < count);
+        }
+
+        public void closeSelect() {
+            this.CLOSE = true;
+        }
+    }
+
+    public static String handleExportData(Map<String, Object> reportData, String[] columns) {
+        StringBuilder sb = new StringBuilder();
+        for (String columnName : columns) {
+            addStringBuffer(sb, reportData, columnName);
+        }
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    public static void addStringBuffer(StringBuilder sb, Map<String, Object> map, String name) {
+        if (map.get(name) == null) {
+            sb.append("-,");
+        } else {
+            String value = String.valueOf(map.get(name));
+            String temp = value.replaceAll("\r", "").replaceAll("\n", "");
+            if (temp.contains(",")) {
+                if (temp.contains("\"")) {
+                    temp = temp.replace("\"", "\"\"");
+                }
+                //将逗号转义
+                temp = "\"" + temp + "\"";
+            }
+            sb.append("\t").append(temp).append(",");
+        }
+    }
+
+    /**
+     * 下载数据接口
+     */
+    @GET
+    @Path("table2")
+    @Consumes
+    public ActionResponse dataProductTableExport(@QueryParam("datasourceid") String datasourceid,
+                                                 @QueryParam("tableName") String tableName) {
+        Object actionResponse = null;
+        DataSourceManager dataSourceManager = dataSourceManagerRepository.findModelById(datasourceid);
+        if (dataSourceManager == null) {
+            return null;
+        }
+        DataSourceType dataSourceType = dataSourceManager.getDataSourceType();
+        LinkInfo linkInfo = JSON.toBean(dataSourceManager.getLinkInfo(), LinkInfo.class);
+        linkInfo.setPassword(Base64Util.decodedText(linkInfo.getPassword()));
+        //覆盖一下
+        List<Map<String, Object>> mapList = dataSourceManagerService.queryAllDataSourceInfo(linkInfo);
+        DataSourceHolder.loadData(mapList);
+        //获取字段中文名称
+        List<Map<String, String>> resultMap = new LinkedList<>();
+        HashMap<String, String> blankmap = new HashMap<>();
+        resultMap.add(blankmap);
+        String columSql = AssemblySql.queryTableFiledAndComment(tableName);
+        List<Map<String, Object>> colums = dataSourceManagerService.executeSql(columSql, dataSourceType.name(), linkInfo, null);
+        Map<String, String> commentResultMap = Maps.newHashMap();
+        for (Map<String, Object> tableFiledAndCommentMap : colums) {
+            String commentName = null;
+            String filedName = (String) tableFiledAndCommentMap.get("Field");
+            if (StringUtils.isNotBlank((String) tableFiledAndCommentMap.get("Comment"))) {
+                commentName = (String) tableFiledAndCommentMap.get("Comment");
+            } else {
+                commentName = "-";
+            }
+            commentResultMap.put(filedName, commentName);
+            blankmap.put(filedName, " ");
+        }
+        //查询所有数据
+        String datasql = "SELECT * FROM " + tableName;
+        List<Map<String, Object>> data = dataSourceManagerService.executeSql(datasql, dataSourceType.name(), linkInfo, null);
+        if (data.size() > 0) {
+            resultMap = data.stream().map(SOmap -> {
+                Map<String, String> temp = new HashMap<>();
+                Iterator it = SOmap.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry entry = (Map.Entry) it.next();
+                    temp.put(entry.getKey().toString(), entry.getValue() == null ? null : entry.getValue().toString());
+                }
+                return temp;
+            }).collect(Collectors.toList());
+        }
+        //组合数据
+        try {
+            List<LinkedHashMap<String, String>> fileData = Lists.newArrayList();
+            LinkedHashMap<String, String> dataMap = null;
+            if (Objects.nonNull(resultMap) && resultMap.size() > 0) {
+                for (Map<String, String> map : resultMap) {
+                    if (map.keySet().size() > 0) {
+                        dataMap = Maps.newLinkedHashMap();
+                        if (Objects.nonNull(commentResultMap) && commentResultMap.size() > 0) {
+                            for (String commentKey : commentResultMap.keySet()) {
+                                for (String key : map.keySet()) {
+                                    if (key.equals(commentKey)) {
+                                        dataMap.put(commentResultMap.get(commentKey), String.valueOf(map.get(key)));
+                                    }
+                                }
+                            }
+                        }
+                        fileData.add(dataMap);
+                    }
+                }
+            }
+
+            if (Objects.isNull(fileData) || fileData.isEmpty()) {
+                throw new LocaleBizServiceException("Console.Resource.Export.isEmpty");
+            }
+
+            DateTimeFormatter formatter = DateTimeFormat.forPattern("yyyyMMddHHmmss");
+            ExcelFileUtils excel = ExcelFileUtils.createXssfExcelUtils(fileData);
+            String fileName = URLEncoder.encode(tableName + "-" + new DateTime().toString(formatter) + ".xlsx", "UTF-8");
+            OutputStream out = response.getOutputStream();
+            XSSFWorkbook workbook = excel.createXssfWorkbook();
+            response.addHeader("Content-disposition", "attachment;filename=" + fileName);
+            workbook.write(out);
+            out.flush();
+            out.close();
+            workbook.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+            actionResponse = ActionExceptionHelper.toResponse(e);
+            return (ActionResponse) actionResponse;
+        }
+
+        return null;
+    }
+}
